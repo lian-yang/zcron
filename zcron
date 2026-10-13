@@ -367,17 +367,27 @@ def cmd_toggle(args, enabled):
     con = connect()
     aid, title = resolve_id(con, args.id_prefix)
     next_ms = None
+    finite = False
     if enabled:
-        cron_expr = con.execute(f"SELECT cron_expr FROM {TABLE} WHERE automation_id=?",
-                                (aid,)).fetchone()[0]
+        row = con.execute(f"SELECT cron_expr, recurring FROM {TABLE} WHERE automation_id=?",
+                          (aid,)).fetchone()
+        cron_expr, recurring = row[0], row[1]
         next_ms = int(next_runs(cron_expr, 1)[0].timestamp() * 1000)
-    con.execute(f"UPDATE {TABLE} SET enabled=?, next_run_at=COALESCE(?, next_run_at), "
-                f"updated_at=? WHERE automation_id=?",
-                (1 if enabled else 0, next_ms,
-                 int(datetime.now().timestamp() * 1000), aid))
+        # 宿主只调度 lifecycle_status=active 的行;有限次任务(recurring=0)复活时
+        # 计数从零起算,否则 run_count>=max_runs 会被立即判完成
+        finite = recurring == 0
+        counters = ", run_count=0, scheduled_run_count=0" if finite else ""
+        con.execute(f"UPDATE {TABLE} SET enabled=1, lifecycle_status='active'{counters}, "
+                    f"next_run_at=?, updated_at=? WHERE automation_id=?",
+                    (next_ms, int(datetime.now().timestamp() * 1000), aid))
+    else:
+        con.execute(f"UPDATE {TABLE} SET enabled=0, updated_at=? WHERE automation_id=?",
+                    (int(datetime.now().timestamp() * 1000), aid))
     con.commit()
     state = "启用" if enabled else "停用"
     extra = f",下次: {fmt_dt(datetime.fromtimestamp(next_ms/1000))}" if enabled and next_ms else ""
+    if enabled and finite:
+        extra += "(有限次任务,计数已清零)"
     print(f"✓ 已{state} {aid}({title}){extra}")
 
 

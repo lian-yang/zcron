@@ -54,7 +54,7 @@ cron 必须恰好 5 字段(分 时 日 月 周),本地时区。下次触发时�
 ### 其他命令
 
 - `list [--disabled]` / `show <id前缀>` — 查看
-- `enable|disable <id前缀>` — 启停(disable 保留配置;enable 会重算下次触发时间)
+- `enable|disable <id前缀>` — 启停(disable 保留配置;enable 会重算下次触发时间,并复活已跑完的任务——有限次任务计数清零重新起算)
 - `rm <id前缀> --yes` — 删除(连 automation_runs 历史一起清)
 - `next "0 9 * * 1" --count 3` — 只预览触发时间,不写库
 

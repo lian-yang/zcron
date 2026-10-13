@@ -118,7 +118,7 @@ zcron show <id前缀>             看单条完整字段
 zcron add                       单条(--title --cron --prompt-file|--prompt)
 zcron add --from-dir DIR        批量导入(.md × N)
 zcron rm <id前缀> --yes         删除(连运行历史)
-zcron enable|disable <id前缀>   启停
+zcron enable|disable <id前缀>   启停(enable 可复活已跑完的任务,有限次任务计数清零)
 zcron next "cron" [--count N]   预览触发时间
 zcron doctor                    库体检 + 最近将触发的任务
 ```
