@@ -27,6 +27,28 @@ zcron add --from-dir ./my-automations --yes
 
 ## 安装
 
+**方式一:skills.sh 一键安装(推荐)**
+
+```bash
+npx skills add lian-yang/zcron
+```
+
+经 [skills.sh](https://skills.sh)(vercel-labs/skills)安装,自动落到当前使用的
+agent 技能目录(Claude Code / Codex / ZCode / Cursor 等都支持)。指定 agent 端:
+
+```bash
+npx skills add lian-yang/zcron -g -y -a zcode   # 例:装到 ~/.zcode/skills
+```
+
+装完技能即含 CLI 工具(技能目录内的 `zcron` 可执行文件),agent 会自动按
+SKILL.md 调用;想在 shell 里直接敲 `zcron`,再补一步:
+
+```bash
+ln -s ~/.zcode/skills/zcron/zcron ~/.local/bin/zcron
+```
+
+**方式二:手动安装 CLI**
+
 ```bash
 git clone https://github.com/lian-yang/zcron.git
 cd zcron
@@ -34,13 +56,6 @@ cd zcron
 ```
 
 或者不装,直接跑仓库里的文件:`python3 zcron doctor`。
-
-**作为 ZCode 技能安装**(让 agent 自己会调用):把本仓库 clone/软链到技能目录——
-
-```bash
-ln -s "$(pwd)" ~/.agents/skills/zcron        # 多端通用技能目录
-ln -s ../../.agents/skills/zcron ~/.zcode/skills/zcron   # zcode CLI 端(相对软链)
-```
 
 ## 快速开始
 
