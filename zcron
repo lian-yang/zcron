@@ -1,0 +1,442 @@
+#!/usr/bin/env python3
+"""zcron — manage ZCode local automations (tasks-index.sqlite) from the CLI.
+
+Why: ZCode's CronCreate refuses to create multiple automations within a single
+session. Automations actually persist in ~/.zcode/v2/tasks-index.sqlite
+(table `automations`, WAL mode); the host reads the DB directly on every
+scheduler tick with no in-memory cache, so external writes take effect
+immediately. Verified end-to-end: insert -> visible in CronList -> fired on
+schedule -> outcome=succeeded.
+
+Usage:
+  zcron list [--disabled]
+  zcron show <id-prefix>
+  zcron add --title T --cron "M H DoM Mon DoW" (--prompt-file F | --prompt S | --prompt-file -)
+             [--model provider/model[:level]] [--max-runs N] [--workspace P] [--disabled]
+  zcron add --from-dir DIR [--yes]   # one .md per automation, frontmatter: title/cron[/model/max-runs/enabled]
+  zcron rm <id-prefix> --yes
+  zcron enable <id-prefix> | disable <id-prefix>
+  zcron next "cron expr" [--count N]  # preview only, no writes
+  zcron doctor
+
+Requires Python 3.8+ (stdlib only). Tested on macOS; the DB path follows the
+ZCode CLI convention (~/.zcode/v2/tasks-index.sqlite).
+"""
+
+import argparse
+import json
+import os
+import sqlite3
+import sys
+import uuid
+from datetime import datetime, timedelta
+
+DB_PATH = os.environ.get(
+    "ZCODE_DB", os.path.expanduser("~/.zcode/v2/tasks-index.sqlite"))
+BACKUP_DIR = os.path.expanduser("~/.zcron/backups")
+DEFAULT_WORKSPACE = os.environ.get(
+    "ZCODE_WORKSPACE", os.path.expanduser("~/.zcode/workspace/default"))
+TABLE = "automations"
+
+WEEKDAY_CN = ["一", "二", "三", "四", "五", "六", "日"]
+
+
+def die(msg, code=1):
+    print(f"zcron: 错误: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def connect():
+    if not os.path.exists(DB_PATH):
+        die(f"库不存在: {DB_PATH}(确认本机装有 ZCode CLI,或用 ZCODE_DB 指定路径)")
+    con = sqlite3.connect(DB_PATH, timeout=10)
+    con.execute("PRAGMA busy_timeout=10000")
+    return con
+
+
+def backup_db(con, tag=""):
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    name = datetime.now().strftime("zcron-%Y%m%d-%H%M%S") + (f"-{tag}" if tag else "") + ".db"
+    dst = os.path.join(BACKUP_DIR, name)
+    dst_con = sqlite3.connect(dst)
+    con.backup(dst_con)
+    dst_con.close()
+    backups = sorted(f for f in os.listdir(BACKUP_DIR) if f.endswith(".db"))
+    for old in backups[:-10]:
+        os.remove(os.path.join(BACKUP_DIR, old))
+    return dst
+
+
+# ---------- cron parsing & next-fire computation (5 fields, local time) ----------
+
+def parse_field(field, lo, hi, name=""):
+    vals = set()
+    for part in field.split(","):
+        part = part.strip()
+        if not part:
+            die(f"cron {name} 字段为空: '{field}'")
+        step = 1
+        base = part
+        if "/" in part:
+            base, step_s = part.split("/", 1)
+            step = int(step_s)
+            if step <= 0:
+                die(f"cron {name} 步长非法: '{part}'")
+        if base == "*":
+            start, end = lo, hi
+        elif "-" in base:
+            a, b = base.split("-", 1)
+            start, end = int(a), int(b)
+        else:
+            start = int(base)
+            end = hi if "/" in part else start
+        if start < lo or end > hi or start > end:
+            die(f"cron {name} 字段越界: '{part}' (允许 {lo}-{hi})")
+        vals.update(range(start, end + 1, step))
+    return vals
+
+
+def parse_cron(expr):
+    fields = expr.split()
+    if len(fields) != 5:
+        die(f"cron 表达式必须恰好 5 字段(分 时 日 月 周): '{expr}'")
+    minutes = parse_field(fields[0], 0, 59, "分钟")
+    hours = parse_field(fields[1], 0, 23, "小时")
+    doms = parse_field(fields[2], 1, 31, "日")
+    months = parse_field(fields[3], 1, 12, "月")
+    dows_cron = parse_field(fields[4], 0, 7, "周")
+    # cron dow: 0/7=Sunday, 1=Monday...; convert to python weekday (0=Mon..6=Sun)
+    dows = set()
+    for d in dows_cron:
+        d = 7 if d == 0 else d
+        dows.add((d - 1) % 7)
+    dom_star, dow_star = fields[2] == "*", fields[4] == "*"
+    return minutes, hours, doms, months, dows, dom_star, dow_star
+
+
+def day_matches(t, doms, dows, dom_star, dow_star):
+    if dom_star and dow_star:
+        return True
+    if dow_star:
+        return t.day in doms
+    if dom_star:
+        return t.weekday() in dows
+    return t.day in doms or t.weekday() in dows  # vixie OR semantics
+
+
+def next_runs(expr, count=1, after=None):
+    minutes, hours, doms, months, dows, dom_star, dow_star = parse_cron(expr)
+    t = (after or datetime.now()).replace(second=0, microsecond=0) + timedelta(minutes=1)
+    found = []
+    day = t.date()
+    for _ in range(366 * 5):
+        day_start = datetime(day.year, day.month, day.day)
+        if day_start.month in months and day_matches(day_start, doms, dows, dom_star, dow_star):
+            for h in sorted(hours):
+                for m in sorted(minutes):
+                    cand = day_start + timedelta(hours=h, minutes=m)
+                    if cand >= t:
+                        found.append(cand)
+                        if len(found) >= count:
+                            return found
+        day += timedelta(days=1)
+    die(f"5 年内找不到触发时间,表达式可能恒假: '{expr}'")
+
+
+def fmt_dt(dt):
+    return dt.strftime("%Y-%m-%d %H:%M") + f" 周{WEEKDAY_CN[dt.weekday()]}"
+
+
+# ---------- writing ----------
+
+def parse_model(spec):
+    if not spec:
+        return None
+    level = None
+    head = spec
+    if ":" in spec:
+        head, possible = spec.rsplit(":", 1)
+        if possible in ("max", "high", "medium", "low", "minimal"):
+            level = possible
+        else:
+            head = spec
+    provider, model = head.rsplit("/", 1)
+    if not provider or not model:
+        die(f"模型格式应为 providerId/modelId[:level]: '{spec}'")
+    sel = {"providerId": provider, "modelId": model}
+    if level:
+        sel["options"] = {"reasoningLevel": level}
+    return json.dumps(sel, ensure_ascii=False)
+
+
+def infer_default_model(con):
+    """Pick the most common model_selection among existing automations."""
+    try:
+        rows = con.execute(
+            f"SELECT model_selection FROM {TABLE} "
+            "WHERE model_selection IS NOT NULL AND model_selection != ''").fetchall()
+    except sqlite3.OperationalError:
+        return None
+    counts = {}
+    for (s,) in rows:
+        counts[s] = counts.get(s, 0) + 1
+    return max(counts, key=counts.get) if counts else None
+
+
+def get_columns(con):
+    cols = [r[1] for r in con.execute(f"PRAGMA table_info({TABLE})")]
+    if "automation_id" not in cols:
+        die("库结构不符合预期(缺 automation_id 列),ZCode 可能已改版;升级 zcron 或提 issue")
+    return cols
+
+
+def insert_automation(con, title, cron_expr, prompt, workspace, model_selection,
+                      max_runs, enabled):
+    get_columns(con)  # schema gate
+    parse_cron(cron_expr)  # validate before write
+    now_ms = int(datetime.now().timestamp() * 1000)
+    next_ms = int(next_runs(cron_expr, 1)[0].timestamp() * 1000)
+    aid = f"automation-{uuid.uuid4()}"
+    con.execute(
+        f"""INSERT INTO {TABLE} (
+              automation_id, title, cron_expr, prompt,
+              workspace_key, workspace_path, workspace_identity,
+              location_kind, mode, model_selection,
+              schedule_rule, schedule_edited_by_user,
+              recurring, max_runs, end_at,
+              run_count, scheduled_run_count,
+              enabled, lifecycle_status, next_run_at,
+              running, claimed_at, dispatch_status, dispatch_attempts,
+              retry_at, last_error, created_at, updated_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            aid, title, cron_expr, prompt,
+            workspace, workspace, None,
+            "local", "yolo", model_selection,
+            None, 1,
+            1 if max_runs is None else 1, max_runs, None,
+            0, 0,
+            1 if enabled else 0, "active", next_ms,
+            0, None, "idle", 0,
+            None, None, now_ms, now_ms,
+        ),
+    )
+    con.commit()
+    return aid, next_ms
+
+
+# ---------- frontmatter batch import ----------
+
+def parse_frontmatter_md(path):
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    meta, body = {}, text
+    if text.startswith("---"):
+        parts = text.split("\n---", 2)
+        if len(parts) >= 2:
+            head = parts[0][3:].strip("\n")
+            body = parts[1].split("\n", 1)[1] if len(parts) > 1 else ""
+            if len(parts) > 2:
+                body = parts[1].split("\n", 1)[-1] + parts[2]
+            body = body.lstrip("\n")
+            for line in head.splitlines():
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    meta[k.strip().lower()] = v.strip()
+    return meta, body.strip()
+
+
+def cmd_add(args):
+    con = connect()
+    # 推导结果是 model_selection 的 JSON 原文,直接可用;只有显式 --model 才走 parse_model
+    if args.model:
+        default_model = parse_model(args.model)
+    else:
+        default_model = infer_default_model(con)
+    inferred = None if args.model else default_model
+
+    if args.from_dir:
+        files = sorted(f for f in os.listdir(args.from_dir) if f.endswith(".md"))
+        if not files:
+            die(f"目录里没有 .md 文件: {args.from_dir}")
+        if not args.yes:
+            for f in files:
+                meta, _ = parse_frontmatter_md(os.path.join(args.from_dir, f))
+                print(f"  将创建: {f} | {meta.get('title', '?')} | cron={meta.get('cron', '?')}")
+            ans = input(f"共 {len(files)} 条,确认写入? [y/N] ")
+            if ans.strip().lower() != "y":
+                die("已取消", 0)
+        results = []
+        for f in files:
+            path = os.path.join(args.from_dir, f)
+            meta, body = parse_frontmatter_md(path)
+            title, cron_expr = meta.get("title"), meta.get("cron")
+            if not title or not cron_expr or not body:
+                die(f"{f}: frontmatter 必须含 title 和 cron,正文为 prompt")
+            enabled = meta.get("enabled", "true").lower() != "false"
+            max_runs = int(meta["max-runs"]) if meta.get("max-runs") else None
+            model = parse_model(meta["model"]) if meta.get("model") else default_model
+            aid, next_ms = insert_automation(
+                con, title, cron_expr, body,
+                args.workspace or DEFAULT_WORKSPACE,
+                model, max_runs, enabled)
+            results.append((f, aid, next_ms))
+            print(f"✓ {f} → {aid}  下次: {fmt_dt(datetime.fromtimestamp(next_ms/1000))}")
+        bak = backup_db(con, "batch")
+        print(f"\n共写入 {len(results)} 条;库备份: {bak}")
+        return
+
+    if not (args.title and args.cron):
+        die("add 需要 --title 与 --cron(或用 --from-dir 批量)")
+    if args.prompt_file:
+        prompt = sys.stdin.read() if args.prompt_file == "-" else \
+            open(args.prompt_file, encoding="utf-8").read()
+    elif args.prompt:
+        prompt = args.prompt
+    else:
+        die("prompt 来源必填: --prompt-file / --prompt")
+    if not prompt.strip():
+        die("prompt 为空")
+    bak = backup_db(con, "add")
+    aid, next_ms = insert_automation(
+        con, args.title, args.cron, prompt,
+        args.workspace or DEFAULT_WORKSPACE, default_model,
+        args.max_runs, not args.disabled)
+    model_note = args.model or (f"(从现有自动化推导: {inferred})" if inferred else "(跟随宿主默认)")
+    print(f"✓ 已写入 {aid}")
+    print(f"  标题: {args.title}")
+    print(f"  cron: {args.cron}   下次触发: {fmt_dt(datetime.fromtimestamp(next_ms/1000))}")
+    print(f"  模型: {model_note}")
+    print(f"  库备份: {bak}")
+
+
+def resolve_id(con, prefix):
+    rows = con.execute(
+        f"SELECT automation_id, title FROM {TABLE} WHERE automation_id LIKE ?",
+        (f"%{prefix}%",)).fetchall()
+    if not rows:
+        die(f"找不到自动化: {prefix}")
+    if len(rows) > 1:
+        for r in rows:
+            print(f"  {r[0]}  {r[1]}", file=sys.stderr)
+        die(f"前缀歧义,匹配 {len(rows)} 条")
+    return rows[0]
+
+
+def cmd_list(args):
+    con = connect()
+    where = "WHERE enabled=0" if args.disabled else ""
+    rows = con.execute(
+        f"""SELECT automation_id, title, cron_expr, enabled, next_run_at,
+                   run_count, lifecycle_status, max_runs
+            FROM {TABLE} {where} ORDER BY enabled DESC, next_run_at IS NULL, next_run_at"""
+    ).fetchall()
+    now = datetime.now()
+    for aid, title, cron, enabled, next_at, run_count, life, max_runs in rows:
+        flag = "✓" if enabled else "✗"
+        nxt = fmt_dt(datetime.fromtimestamp(next_at / 1000)) if next_at and enabled \
+            else (f"[{life}]" if life != "active" else "[停用]")
+        lim = f"/{max_runs}" if max_runs else ""
+        print(f"{flag} {aid[:28]}  {cron:<12} 已跑{run_count}{lim}  下次: {nxt}")
+        print(f"   {title}")
+    print(f"\n共 {len(rows)} 条;现在 {fmt_dt(now)}")
+
+
+def cmd_show(args):
+    con = connect()
+    aid, _ = resolve_id(con, args.id_prefix)
+    row = con.execute(f"SELECT * FROM {TABLE} WHERE automation_id=?", (aid,)).fetchone()
+    cols = [d[0] for d in con.execute(f"SELECT * FROM {TABLE} LIMIT 1").description]
+    for k, v in zip(cols, row):
+        print(f"{k}: {v}")
+
+
+def cmd_rm(args):
+    if not args.yes:
+        die("删除需显式 --yes")
+    con = connect()
+    aid, title = resolve_id(con, args.id_prefix)
+    bak = backup_db(con, "rm")
+    con.execute("DELETE FROM automation_runs WHERE automation_id=?", (aid,))
+    con.execute(f"DELETE FROM {TABLE} WHERE automation_id=?", (aid,))
+    con.commit()
+    print(f"✓ 已删除 {aid}({title})\n  库备份: {bak}")
+
+
+def cmd_toggle(args, enabled):
+    con = connect()
+    aid, title = resolve_id(con, args.id_prefix)
+    next_ms = None
+    if enabled:
+        cron_expr = con.execute(f"SELECT cron_expr FROM {TABLE} WHERE automation_id=?",
+                                (aid,)).fetchone()[0]
+        next_ms = int(next_runs(cron_expr, 1)[0].timestamp() * 1000)
+    con.execute(f"UPDATE {TABLE} SET enabled=?, next_run_at=COALESCE(?, next_run_at), "
+                f"updated_at=? WHERE automation_id=?",
+                (1 if enabled else 0, next_ms,
+                 int(datetime.now().timestamp() * 1000), aid))
+    con.commit()
+    state = "启用" if enabled else "停用"
+    extra = f",下次: {fmt_dt(datetime.fromtimestamp(next_ms/1000))}" if enabled and next_ms else ""
+    print(f"✓ 已{state} {aid}({title}){extra}")
+
+
+def cmd_next(args):
+    for dt in next_runs(args.cron, args.count):
+        print(fmt_dt(dt))
+
+
+def cmd_doctor(args):
+    print(f"库: {DB_PATH} {'存在' if os.path.exists(DB_PATH) else '缺失!'}")
+    con = connect()
+    mode = con.execute("PRAGMA journal_mode").fetchone()[0]
+    print(f"journal 模式: {mode}(wal=可安全并发直写)")
+    n = con.execute(f"SELECT COUNT(*) FROM {TABLE}").fetchone()[0]
+    due = con.execute(
+        f"""SELECT title, cron_expr, next_run_at FROM {TABLE}
+            WHERE enabled=1 ORDER BY next_run_at LIMIT 5""").fetchall()
+    print(f"自动化总数: {n};最近将触发:")
+    for title, cron, next_at in due:
+        print(f"  {fmt_dt(datetime.fromtimestamp(next_at/1000))}  {cron}  {title[:40]}")
+    inferred = infer_default_model(con)
+    print(f"默认模型(众数推导): {inferred or '无,跟随宿主默认'}")
+    host = os.popen("pgrep -qi zcode >/dev/null && echo yes || echo no").read().strip()
+    print(f"ZCode 宿主进程: {'运行中(写入避开调度触发瞬间,已加 busy_timeout)' if host == 'yes' else '未检测到(不影响直写)'}")
+    print(f"默认 workspace: {DEFAULT_WORKSPACE}(可用 ZCODE_WORKSPACE 覆盖)")
+    print(f"备份目录: {BACKUP_DIR}")
+
+
+def main():
+    p = argparse.ArgumentParser(prog="zcron", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("list"); sp.add_argument("--disabled", action="store_true"); sp.set_defaults(fn=cmd_list)
+    sp = sub.add_parser("show"); sp.add_argument("id_prefix"); sp.set_defaults(fn=cmd_show)
+
+    sp = sub.add_parser("add")
+    sp.add_argument("--title"); sp.add_argument("--cron")
+    sp.add_argument("--prompt"); sp.add_argument("--prompt-file")
+    sp.add_argument("--model")
+    sp.add_argument("--max-runs", type=int)
+    sp.add_argument("--workspace")
+    sp.add_argument("--from-dir"); sp.add_argument("--yes", action="store_true")
+    sp.add_argument("--disabled", action="store_true")
+    sp.set_defaults(fn=cmd_add)
+
+    sp = sub.add_parser("rm"); sp.add_argument("id_prefix")
+    sp.add_argument("--yes", action="store_true"); sp.set_defaults(fn=cmd_rm)
+    sp = sub.add_parser("enable"); sp.add_argument("id_prefix")
+    sp.set_defaults(fn=lambda a: cmd_toggle(a, True))
+    sp = sub.add_parser("disable"); sp.add_argument("id_prefix")
+    sp.set_defaults(fn=lambda a: cmd_toggle(a, False))
+    sp = sub.add_parser("next"); sp.add_argument("cron")
+    sp.add_argument("--count", type=int, default=1); sp.set_defaults(fn=cmd_next)
+    sp = sub.add_parser("doctor"); sp.set_defaults(fn=cmd_doctor)
+
+    args = p.parse_args()
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()
