@@ -1,9 +1,10 @@
 # zcron
 
 **Batch-manage [ZCode](https://zcode.ai) local automations from your terminal.**
-批量创建/管理 ZCode 定时自动化,绕过单会话 CronCreate 限制。单文件、零依赖(Python 3 标准库)。
+批量创建/管理 ZCode 定时自动化,绕过 CronCreate 单会话限制与 20 条总数上限。单文件、零依赖(Python 3 标准库)。
 
-> English TL;DR: ZCode's `CronCreate` refuses to create multiple automations in one session.
+> English TL;DR: ZCode's `CronCreate` refuses to create multiple automations in one session,
+> and also rejects creation once you hit 20 automations total.
 > Automations actually live in a local SQLite DB (`~/.zcode/v2/tasks-index.sqlite`, table
 > `automations`, WAL mode) that the host re-reads on every scheduler tick — no in-memory cache.
 > `zcron` writes there directly. Verified end-to-end: insert → shows up in CronList →
@@ -12,7 +13,8 @@
 ## 为什么
 
 在 ZCode 会话里想让 agent 挂多个定时任务(雷达、监控、周报管线……),`CronCreate` 会被
-"单个会话拒建多个"挡住,只能开 N 个会话逐个建。`zcron` 把这件事变成一条命令:
+"单个会话拒建多个"挡住,只能开 N 个会话逐个建;总数到 20 条后更是直接拒建。
+`zcron` 两道闸门都绕过,把这件事变成一条命令:
 
 ```bash
 zcron add --from-dir ./my-automations --yes

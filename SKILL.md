@@ -1,15 +1,16 @@
 ---
 name: zcron
-description: ZCode 定时自动化(automation/cron)的批量创建与管理。当用户要一次创建多个定时任务、CronCreate 被单会话限制拒绝、或需要列出/启停/删除/预览已有自动化时使用。直写本地自动化库(端到端验证过),写前自动备份。
+description: ZCode 定时自动化(automation/cron)的批量创建与管理。当用户要一次创建多个定时任务、CronCreate 被单会话限制或 20 条总数上限拒绝、或需要列出/启停/删除/预览已有自动化时使用。直写本地自动化库(端到端验证过),写前自动备份。
 ---
 
 # zcron — ZCode 自动化直写管理
 
 ## 原理(为什么能用)
 
-ZCode 的 CronCreate 在单个会话里拒建多条自动化,但 automations 实际持久化在本地
-`~/.zcode/v2/tasks-index.sqlite` 的 `automations` 表(WAL 模式),宿主每次调度 tick
-直接查库、**无内存缓存**——外部直写即刻生效。
+ZCode 的 CronCreate 有两道闸门:单个会话里拒建多条,且自动化总数上限 20 条(超量拒建)。
+但 automations 实际持久化在本地 `~/.zcode/v2/tasks-index.sqlite` 的 `automations`
+表(WAL 模式),宿主每次调度 tick 直接查库、**无内存缓存**——外部直写即刻生效,
+两道闸门都不经过。
 
 已端到端验证(2026-10-12):直写插入 → CronList 立即可见 → 宿主按 next_run_at 准时调度
 → `automation_runs.outcome=succeeded`。
